@@ -326,7 +326,7 @@ tool schemas the agent sees (`catalog._schema`).
 
 | Layer | File | Needs API? | Proves |
 |---|---|---|---|
-| Dry run | `backend/tests/test_orchestrator_dry_run.py` (29 tests) | No | Loop control flow, limits, errors, logging, router validation, adapter mapping, endpoint shape |
+| Dry run | `backend/tests/test_orchestrator_dry_run.py` (43 tests) | No | Loop control flow, limits, errors, logging, router validation, adapter mapping, endpoint shape |
 | Live scenarios | `evals/run_scenarios.py` + `evals/scenarios.py` (57 scenarios) | Yes | Routing and agent behavior with the real model and the real fixture |
 
 The dry run uses a scripted model and the real in-process mock tools.
