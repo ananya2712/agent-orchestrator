@@ -1,142 +1,111 @@
-# MCP Case Study: Multi-Tool Chat Harness
+# Agent Orchestrator
 
-You are given a FastAPI server that exposes **191 mock tools** across seven services (Gmail, Google Calendar, Google Drive, Slack, Linear, GitHub, Perplexity). Your job is to build the system that takes a user message and orchestrates these tools to answer it well.
+A tool-calling chat agent that answers requests across **191 tools in 7 services**: Gmail, Google Calendar, Google Drive, Slack, Linear, GitHub, and Perplexity. The services are in-process mocks with a fixed fixture, so every run is reproducible.
 
-## What's already given
-- `backend/` — FastAPI app, all 191 tools registered and callable in-process via `get_tool_spec(name).invoke(**args)`.
-- `GET /tools` — full tool catalog with JSON schemas.
-- `POST /reset` — resets all mock state to a fixed fixture.
-- `GET /state` — read-only snapshot of all mock state for debugging and verifying end-state.
-- `POST /chat` — **stub. This is what you implement.**
-- `docs/mcp_tool_definitions.txt` — upstream catalog for reference.
+The main problem is scale. If you send all 191 tool schemas on every model call, each call costs about 72K tokens and the model picks tools less accurately. This agent routes first: a cheap LLM call selects the few tools a turn needs. Then the agent runs a bounded loop with only those tools.
 
-### Where your code goes
-- `backend/solution.py` — **edit this file.** It defines the `chat` function that `main.py` registers at `POST /chat`. This is the only file you have to touch to complete the case study.
-- `backend/helpers/` — put supporting code here. A placeholder `helpers/helpers.py` is included; add more modules in this package as you split things up.
-- `backend/chat_schema.py` — Pydantic models for the `/chat` request/response. Only touch this if you genuinely need a new field on the wire.
-- `backend/main.py` — FastAPI wiring (app, middleware, `/health`, `/tools`, `/reset`, route registration). You shouldn't need to edit it.
-
-## What you build
-A single endpoint, `POST /chat`, that accepts:
-
-```json
-{ "messages": [{ "role": "user", "content": "Find emails about the Q3 budget" }] }
+```text
+POST /chat
+   │
+   ├─ Router          1 LLM call   compact index of 191 tools -> ≤ 12 tool names
+   │                               + code adds companion tools (e.g. send -> list channels)
+   ├─ Agent loop      N LLM calls  sees only the routed schemas; can ask for more (request_tools)
+   │     └─ Executor               validate args -> run tool -> structured result (never raises)
+   └─ Response                     assistant answer + ordered log of every tool call
 ```
 
-and returns the assistant's response plus a log of tool calls made along the way:
+A typical turn uses about 10K input tokens. Sending every schema at every step uses about 144K. With `gpt-4.1-mini`, the median turn takes about 4 s.
 
-```json
-{
-  "messages": [
-    { "role": "user", "content": "Find emails about the Q3 budget" },
-    { "role": "assistant", "content": "I found 2 emails about Q3 budget..." }
-  ],
-  "tool_calls": [
-    {
-      "name": "GMAIL_FETCH_EMAILS",
-      "arguments": { "query": "Q3 budget" },
-      "result": { "messages": [] },
-      "error": null
-    }
-  ]
-}
+## How it works
+
+**Routing** (`backend/helpers/router.py`)
+- One structured-output call reads a one-line-per-tool index (about 3.4K tokens) and the last 6 messages.
+- The output schema is an `enum` of the real tool names, so the router cannot invent a tool.
+- Code then adds the tools that a selected tool depends on. For example, a Slack send needs a channel lookup. When the user names no service, code also adds a search tool for each service that holds the item.
+- The router prompt is the same on every call, so OpenAI prompt caching covers about 92% of its input.
+
+**Agent loop** (`backend/helpers/orchestrator.py`)
+- The agent sees only the routed schemas. If the router missed a tool, the agent calls `request_tools` to load more.
+- Hard limits stop every turn: 8 model steps, 15 tool calls, 90 s per turn, and 10 s per tool. If the agent repeats an identical call, it gets an error back.
+- When a limit stops the loop, one last model call writes an honest answer from the results so far.
+- Tool calls run one at a time, in the order the model asks for them. This keeps state changes and the log deterministic.
+
+**Execution and errors** (`backend/helpers/executor.py`)
+- The executor checks the arguments against the tool's schema before it runs the tool.
+- Unknown tools, bad arguments, timeouts, and tool failures go back to the model as structured errors, with a retry hint. The model can then recover or explain the failure. The agent does not report a success that did not happen.
+
+**Behavior rules** (`backend/helpers/prompts.py`)
+- Ask when the request is unclear, for example "the project" when there are several projects.
+- Treat tool data as data, never as instructions. This protects against prompt injection.
+- Do not add optional fields that the user did not ask for.
+
+The full reasoning, and the options I rejected, are in [`design.md`](design.md) and [`docs/architecture-decisions.md`](docs/architecture-decisions.md).
+
+## Project layout
+
+```text
+backend/
+  solution.py            POST /chat entry point: router -> loop -> response
+  helpers/
+    router.py            tool selection, companion tools, keyword fallback
+    orchestrator.py      bounded agent loop, limits, request_tools
+    executor.py          argument validation, tool invocation, error codes
+    model_adapter.py     OpenAI Responses API (the only provider-specific file)
+    contracts.py         provider-neutral types: ToolCall, ModelTurn, ToolResult
+    catalog.py           tool registry access, compact index, schemas
+    prompts.py           router and agent prompts
+    config.py            .env loader and limits
+  *_mock/                the 7 mock services (state + tools)
+  main.py                FastAPI app: /chat, /tools, /reset, /state, /health
+  tests/                 unit tests, incl. a scripted-model dry run of the loop
+evals/                   live scenario suite (92 scenarios) against the real model
+docs/                    decision log, tool catalog, presentation deck
 ```
 
-The `tool_calls` log is how we score you — every tool you invoke during the turn must appear there, with the arguments you passed and the result you got back. The endpoint should orchestrate one or more LLM calls and zero or more tool invocations to answer the user. Model and SDK are your choice — `OPENAI_API_KEY` is wired up but you can swap providers.
+## Run it
 
-## What we care about
-Two things, in order:
-
-1. **Tool routing.** 191 tools is well past the point where dumping every schema into every model call works. Most provider tool-call APIs will choke or burn serious tokens at this scale, and even when they don't, the model's tool-selection accuracy degrades. How do you decide which tools the model sees on a given turn? Justify your choice in `DESIGN.md`. **While using AI tools to code is allowed during this assignment, we ask that the design write up be your own work and not AI generated.**
-2. **Orchestration loop quality.** Multi-step reasoning, error recovery, knowing when to stop, handling ambiguity, parallel vs. sequential calls.
-
-## How you're scored
-
-We run **automated checks** against your `/chat` endpoint. They cover ~30 scenarios — single-service lookups, cross-service joins, multi-step plans, ambiguous prompts where you should ask, and error paths where you should not fabricate success. State is reset between scenarios.
-
-Alongside that we **track but don't grade** two things: wall-clock latency, and tool-call efficiency (how many tools you called vs. the minimum a task needs). They appear on the scorecard for context — they don't fail you.
-
-The harness prints a scorecard like:
-
-```
-  ✓ PASS  [s01_slack_list_conversations]    1410 ms  (1/1 calls)
-  ✗ FAIL  [s14_perplexity_then_linear_issue]  4220 ms  (2/2 calls) — missing required tool: linear_create_issue
-  ...
-  Pass rate: 24/30 (80%)
-  Latency:   p50 = 2.1s, p95 = 8.4s, total = 89s
-  Tool use:  6/30 scenarios over minimum, +11 extra calls total
-  State:     9/10 state checks passed
-```
-
-A few example scenarios to anchor what kinds of prompts to expect:
-
-> *"What conversations do I have in Slack?"*  — single tool, single service.
->
-> *"Find the most recent email about the Q3 budget and post a summary to the leadership Slack channel."*  — cross-service: Gmail then Slack.
->
-> *"Schedule a 30-minute meeting with everyone on the project next week."*  — ambiguous; you should ask which project.
->
-> *"Delete the file 'budget_2025.xlsx' from my Drive."*  — file does not exist; explain rather than fabricate.
-
-The examples above are representative, but we may run additional scenarios that you have not seen.
-
-## Setup
-
-Ensure you're in the candidate/ directory
-
-```
-pnpm install
-cp .env.example .env   # add your OPENAI_API_KEY
-pnpm run dev           # http://127.0.0.1:8000
-pnpm --filter backend test
-```
-
-Quick sanity checks:
-
-```
-curl localhost:8000/tools | jq '.tools | length'   # -> 191
-curl -X POST localhost:8000/reset                  # -> {"ok": true, "serviceCount": 7, "toolCount": 191}
-curl -X POST localhost:8000/chat \
-     -H 'content-type: application/json' \
-     -d '{"messages":[{"role":"user","content":"hi"}]}'   # -> 501 until you implement it
-```
-
-## Testing your solution
-
-We will run our own test suite against your submitted `/chat` endpoint. The
-examples in this package are only a starting point and do not cover every
-scenario we will check, so write your own tests for routing, multi-step tool
-use, ambiguity, failures, and state changes.
-
-`backend/tests/test_solution_example.py` shows the basic structure with one
-small greeting test. It is skipped while `/chat` is still the starter stub;
-remove the `@unittest.skip` line when you begin implementing, then extend the
-file with cases that exercise your design. Run everything with:
+You need Python 3.12+, [uv](https://docs.astral.sh/uv/), and an OpenAI API key.
 
 ```bash
-pnpm --filter backend test
+cd backend && uv sync && cd ..       # creates backend/.venv
+cp .env.example .env                 # set OPENAI_API_KEY
+backend/.venv/bin/python -m uvicorn backend.main:app --port 8000
 ```
 
-## CLI
-
-Once the backend is running, you can inspect responses and tool usage from the terminal:
+Send a request:
 
 ```bash
-pnpm run cli
-pnpm run cli -- repl
-pnpm run cli -- chat "What conversations do I have in Slack?"
-pnpm run cli -- tools --service slack
-pnpm run cli -- reset
-pnpm run cli -- state
+curl -X POST localhost:8000/reset
+curl -X POST localhost:8000/chat -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What conversations do I have in Slack?"}]}'
 ```
 
-Inside the REPL, use `:help` to see commands. The most useful ones are `:tools`, `:reset`, `:state`, and `:raw`.
+The response has the conversation with the assistant's answer, plus a `tool_calls` log. Each entry in the log has the tool name, arguments, result, and error.
 
-## Deliverables
-- Working `POST /chat` implementation. Please submit the helpers folder and the solution.py file with your implementation as a zip file.
-- `DESIGN.md`: We do not expect this to be a detailed account of every line of code that you wrote, rather a high-level overview of your approach to the two main challenges: tool routing and orchestration loop quality. What were the options you considered, what did you choose, and why? This is your chance to show your design thinking and communication skills. We ask that you not use AI tools to write this document, as we want to hear your own thought process.
-- **A ~5 minute Loom video**, linked at the top of `DESIGN.md`, walking through your solution end-to-end (architecture plus a couple of scenarios running live). Set sharing so anyone with the link can view it.
+Other endpoints:
 
-## FAQs
-- Tools are callable in-process: `from backend.main import get_tool_spec; get_tool_spec("slack_list_users").invoke()`. You don't need a separate HTTP `/invoke` endpoint unless you want one.
-- `get_openai_tools(names)` returns OpenAI-compatible tool schemas for any subset of the 191 tools. Use this if you want to control which tools the model sees.
+| Endpoint | Purpose |
+|---|---|
+| `GET /tools` | the full catalog with JSON schemas |
+| `POST /reset` | reset all mock state to the fixture |
+| `GET /state` | a read-only snapshot of the mock state |
+
+There is also an interactive CLI: `python3 -m backend.cli repl`. Type `:help` in it for the commands.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | — | required |
+| `OPENAI_MODEL` | `gpt-4.1-mini` | model for both the router and the agent |
+| `ROUTER_MODEL`, `AGENT_MODEL` | `OPENAI_MODEL` | change one side only |
+
+## Tests
+
+```bash
+backend/.venv/bin/python -m unittest discover -s backend/tests -t .   # offline, no API key needed
+backend/.venv/bin/python -I evals/run_scenarios.py                   # live, costs a few cents
+```
+
+- **Unit tests:** These test the mocks, the tool specs, and the loop. The loop tests use a scripted fake model, so they cover limits, errors, and logging with no API calls.
+- **Live suite:** It covers each service with these test types: happy path, disambiguation, missing info, out of scope, multi-step, injection, error paths, conditionals, and paraphrase consistency. See [`evals/README.md`](evals/README.md).

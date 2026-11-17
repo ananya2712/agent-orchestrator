@@ -33,7 +33,6 @@ POST /chat ── solution.chat
 | `helpers/router.py` | `route`, `expand`, keyword fallback |
 | `helpers/executor.py` | Argument cleanup, syntax guard, validation, invocation, error codes |
 | `helpers/orchestrator.py` | Loop, limits, dedupe, meta-tool, final answer |
-| `helpers/helpers.py` | Provided placeholder; unchanged |
 
 ---
 
@@ -308,7 +307,7 @@ tool schemas the agent sees (`catalog._schema`).
 
 ### ADR-18 — Edit only `solution.py` and new modules in `helpers/`
 
-- **Why:** The brief says other edits may break grading. The provided `helpers/helpers.py` stays unchanged. The failing `test_chat_endpoint_returns_501_until_implemented` stays as provided.
+- **Why:** The brief says other edits may break grading.
 
 ### ADR-19 — Stdlib `.env` loader; process environment wins
 
